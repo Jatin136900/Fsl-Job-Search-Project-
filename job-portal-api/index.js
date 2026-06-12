@@ -8,7 +8,7 @@ const companyRoutes = require('./routes/companies');
 const jobRoutes = require('./routes/jobs');
 const applicationRoutes = require('./routes/applications');
 const messageRoutes = require('./routes/messages');
-const notificationRoutes = require('./routes/notifications');
+const shortlistRoutes = require('./routes/shortlists');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -24,7 +24,7 @@ app.use('/api/companies', companyRoutes);
 app.use('/api/jobs', jobRoutes);
 app.use('/api/applications', applicationRoutes);
 app.use('/api/messages', messageRoutes);
-app.use('/api/notifications', notificationRoutes);
+app.use('/api/shortlists', shortlistRoutes);
 
 // Simple Health Check Endpoint
 app.get('/health', (req, res) => {

@@ -5,14 +5,14 @@ const { authenticateToken } = require('../middleware/auth');
 
 // GET /api/companies/:id - Get company profile
 router.get('/:id', authenticateToken, async (req, res) => {
-  const companyId = parseInt(req.params.id);
+  const companyId = req.params.id; // UUID string
 
   try {
     const [companies] = await pool.query(
-      `SELECT c.*, u.first_name, u.last_name, u.email, u.mobile_no, u.avatar_url, u.bio, u.role
-       FROM companies c
-       JOIN users u ON c.user_id = u.id
-       WHERE c.id = ?`,
+      `SELECT c.*, u.FirstName, u.LastName, u.Email, u.MobileNo, u.Bio
+       FROM Companies c
+       JOIN Users u ON c.UserId = u.Id
+       WHERE c.Id = ? AND c.IsActive = TRUE`,
       [companyId]
     );
 
@@ -21,9 +21,29 @@ router.get('/:id', authenticateToken, async (req, res) => {
     }
 
     const profile = companies[0];
-    delete profile.password_hash;
 
-    return res.json({ success: true, data: profile });
+    // Format response to be consistent
+    const responseData = {
+      id: profile.Id,
+      userId: profile.UserId,
+      firstName: profile.FirstName,
+      lastName: profile.LastName,
+      email: profile.Email,
+      mobileNo: profile.MobileNo,
+      bio: profile.Bio,
+      name: profile.Name,
+      taxId: profile.TaxId,
+      vatNo: profile.VatNo,
+      industryId: profile.IndustryId,
+      size: profile.Size,
+      website: profile.Website,
+      logo: profile.Logo,
+      description: profile.Description,
+      contactPerson: profile.ContactPerson,
+      createdAt: profile.CreatedAt
+    };
+
+    return res.json({ success: true, data: responseData });
   } catch (error) {
     console.error('Get Company Error:', error);
     return res.status(500).json({ success: false, message: 'Server error retrieving company profile' });
@@ -32,7 +52,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
 
 // PUT /api/companies/:id - Update company profile
 router.put('/:id', authenticateToken, async (req, res) => {
-  const companyId = parseInt(req.params.id);
+  const companyId = req.params.id;
 
   // Authorization check
   if (req.user.role !== 'company' || req.user.companyId !== companyId) {
@@ -40,11 +60,12 @@ router.put('/:id', authenticateToken, async (req, res) => {
   }
 
   const {
-    first_name, last_name, mobile_no, avatar_url, bio,
-    name, tax_id, vat_no, industry, size, website, logo_url, description, contact_person
+    firstName, lastName, mobileNo, bio,
+    name, taxId, vatNo, industryId, size, website, logo, description, contactPerson
   } = req.body;
 
-  if (name && name.trim() === '') {
+  const companyName = name || req.body.CompanyName;
+  if (companyName && companyName.trim() === '') {
     return res.status(400).json({ success: false, message: 'Company name cannot be empty' });
   }
 
@@ -52,41 +73,56 @@ router.put('/:id', authenticateToken, async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    // 1. Get user_id for this company
-    const [companies] = await connection.query('SELECT user_id FROM companies WHERE id = ?', [companyId]);
+    // 1. Get UserId for this Company
+    const [companies] = await connection.query('SELECT UserId FROM Companies WHERE Id = ?', [companyId]);
     if (companies.length === 0) {
       await connection.rollback();
       return res.status(404).json({ success: false, message: 'Company record not found' });
     }
-    const userId = companies[0].user_id;
+    const userId = companies[0].UserId;
 
-    // 2. Update users table
+    // 2. Update Users table
     await connection.query(
-      `UPDATE users 
-       SET first_name = COALESCE(?, first_name),
-           last_name = COALESCE(?, last_name),
-           mobile_no = COALESCE(?, mobile_no),
-           avatar_url = COALESCE(?, avatar_url),
-           bio = COALESCE(?, bio)
-       WHERE id = ?`,
-      [first_name, last_name, mobile_no, avatar_url, bio, userId]
+      `UPDATE Users 
+       SET FirstName = COALESCE(?, FirstName),
+           LastName = COALESCE(?, LastName),
+           MobileNo = COALESCE(?, MobileNo),
+           Bio = COALESCE(?, Bio)
+       WHERE Id = ?`,
+      [
+        firstName || req.body.first_name || null,
+        lastName || req.body.last_name || null,
+        mobileNo || req.body.mobile_no || null,
+        bio || null,
+        userId
+      ]
     );
 
-    // 3. Update companies table
+    // 3. Update Companies table
     await connection.query(
-      `UPDATE companies
-       SET name = COALESCE(?, name),
-           tax_id = COALESCE(?, tax_id),
-           vat_no = COALESCE(?, vat_no),
-           industry = COALESCE(?, industry),
-           size = COALESCE(?, size),
-           website = COALESCE(?, website),
-           logo_url = COALESCE(?, logo_url),
-           description = COALESCE(?, description),
-           contact_person = COALESCE(?, contact_person)
-       WHERE id = ?`,
+      `UPDATE Companies
+       SET Name = COALESCE(?, Name),
+           TaxId = COALESCE(?, TaxId),
+           VatNo = COALESCE(?, VatNo),
+           IndustryId = COALESCE(?, IndustryId),
+           Size = COALESCE(?, Size),
+           Website = COALESCE(?, Website),
+           Logo = COALESCE(?, Logo),
+           Description = COALESCE(?, Description),
+           ContactPerson = COALESCE(?, ContactPerson),
+           UpdatedAt = CURRENT_TIMESTAMP
+       WHERE Id = ?`,
       [
-        name, tax_id, vat_no, industry, size, website, logo_url, description, contact_person, companyId
+        companyName || null,
+        taxId || req.body.tax_id || null,
+        vatNo || req.body.vat_no || null,
+        industryId || req.body.industry_id || null,
+        size || null,
+        website || null,
+        logo || req.body.logo_url || null,
+        description || null,
+        contactPerson || req.body.contact_person || null,
+        companyId
       ]
     );
 

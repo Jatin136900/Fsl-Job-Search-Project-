@@ -18,6 +18,23 @@ function authenticateToken(req, res, next) {
   });
 }
 
+function optionalAuthenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
+
+  if (!token) {
+    return next();
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ success: false, message: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+}
+
 function requireRole(role) {
   return (req, res, next) => {
     if (!req.user || req.user.role !== role) {
@@ -29,5 +46,6 @@ function requireRole(role) {
 
 module.exports = {
   authenticateToken,
+  optionalAuthenticateToken,
   requireRole
 };

@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const pool = require('../db');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 
@@ -20,25 +21,24 @@ router.post('/', authenticateToken, requireRole('candidate'), async (req, res) =
   try {
     await connection.beginTransaction();
 
-    // 1. Verify job vacancy exists and is active
+    // 1. Verify job vacancy exists and is open
     const [jobs] = await connection.query(
-      `SELECT jv.id, jv.title, jv.company_id, c.user_id as company_user_id 
-       FROM job_vacancies jv
-       JOIN companies c ON jv.company_id = c.id
-       WHERE jv.id = ? AND jv.status = 'active'`,
+      `SELECT Id, CompanyId, UserId as CompanyUserId, Title 
+       FROM JobVacancies 
+       WHERE Id = ? AND Status = 'open' AND IsActive = TRUE`,
       [vacancy_id]
     );
 
     if (jobs.length === 0) {
       await connection.rollback();
-      return res.status(404).json({ success: false, message: 'Active job vacancy not found' });
+      return res.status(404).json({ success: false, message: 'Open job vacancy not found' });
     }
 
     const job = jobs[0];
 
     // 2. Check if candidate already applied
     const [existingApplications] = await connection.query(
-      'SELECT id FROM applications WHERE candidate_id = ? AND vacancy_id = ?',
+      'SELECT Id FROM Applications WHERE CandidateId = ? AND VacancyId = ? AND IsActive = TRUE',
       [candidateId, vacancy_id]
     );
 
@@ -47,29 +47,13 @@ router.post('/', authenticateToken, requireRole('candidate'), async (req, res) =
       return res.status(400).json({ success: false, message: 'You have already applied for this job vacancy' });
     }
 
+    const applicationId = crypto.randomUUID();
+
     // 3. Create application
-    const [result] = await connection.query(
-      'INSERT INTO applications (candidate_id, vacancy_id, status) VALUES (?, ?, ?)',
-      [candidateId, vacancy_id, 'pending']
-    );
-
-    // Fetch candidate's name for notification
-    const [candidateUser] = await connection.query(
-      'SELECT first_name, last_name FROM users WHERE id = ?',
-      [req.user.id]
-    );
-    const candidateName = candidateUser.length > 0 
-      ? `${candidateUser[0].first_name} ${candidateUser[0].last_name}` 
-      : 'A candidate';
-
-    // 4. Send notification to the company
     await connection.query(
-      'INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)',
-      [
-        job.company_user_id,
-        'application',
-        `${candidateName} has applied for your job vacancy: ${job.title}.`
-      ]
+      `INSERT INTO Applications (Id, UserId, CandidateId, VacancyId, CompanyId, Status, IsActive) 
+       VALUES (?, ?, ?, ?, ?, 'applied', TRUE)`,
+      [applicationId, req.user.id, candidateId, vacancy_id, job.CompanyId]
     );
 
     await connection.commit();
@@ -78,10 +62,10 @@ router.post('/', authenticateToken, requireRole('candidate'), async (req, res) =
       success: true,
       message: 'Application submitted successfully',
       data: {
-        application_id: result.insertId,
+        application_id: applicationId,
         candidate_id: candidateId,
         vacancy_id,
-        status: 'pending'
+        status: 'applied'
       }
     });
   } catch (error) {
@@ -95,19 +79,19 @@ router.post('/', authenticateToken, requireRole('candidate'), async (req, res) =
 
 // GET /api/applications/:id - Get application detail (accessible by the candidate or company owner)
 router.get('/:id', authenticateToken, async (req, res) => {
-  const applicationId = parseInt(req.params.id);
+  const applicationId = req.params.id; // UUID string
 
   try {
     const [applications] = await pool.query(
-      `SELECT a.*, jv.title as job_title, jv.company_id, c.name as company_name, c.user_id as company_user_id,
-             u.first_name as candidate_first_name, u.last_name as candidate_last_name, u.email as candidate_email,
-             cand.user_id as candidate_user_id
-       FROM applications a
-       JOIN job_vacancies jv ON a.vacancy_id = jv.id
-       JOIN companies c ON jv.company_id = c.id
-       JOIN candidates cand ON a.candidate_id = cand.id
-       JOIN users u ON cand.user_id = u.id
-       WHERE a.id = ?`,
+      `SELECT a.*, jv.Title as job_title, jv.CompanyId, c.Name as company_name, c.UserId as company_user_id,
+              u.FirstName as candidate_first_name, u.LastName as candidate_last_name, u.Email as candidate_email,
+              cand.UserId as candidate_user_id
+       FROM Applications a
+       JOIN JobVacancies jv ON a.VacancyId = jv.Id
+       JOIN Companies c ON jv.CompanyId = c.Id
+       JOIN Candidate cand ON a.CandidateId = cand.Id
+       JOIN Users u ON cand.UserId = u.Id
+       WHERE a.Id = ? AND a.IsActive = TRUE`,
       [applicationId]
     );
 
@@ -118,14 +102,30 @@ router.get('/:id', authenticateToken, async (req, res) => {
     const application = applications[0];
 
     // Authorization check: Must be candidate owner or company owner of vacancy
-    const isCandidateOwner = req.user.role === 'candidate' && req.user.candidateId === application.candidate_id;
-    const isCompanyOwner = req.user.role === 'company' && req.user.companyId === application.company_id;
+    const isCandidateOwner = req.user.role === 'candidate' && req.user.candidateId === application.CandidateId;
+    const isCompanyOwner = req.user.role === 'company' && req.user.companyId === application.CompanyId;
 
     if (!isCandidateOwner && !isCompanyOwner) {
       return res.status(403).json({ success: false, message: 'Access denied. Unauthorized to view application details.' });
     }
 
-    return res.json({ success: true, data: application });
+    // Format fields to match output structure expected
+    const responseData = {
+      id: application.Id,
+      userId: application.UserId,
+      candidateId: application.CandidateId,
+      vacancyId: application.VacancyId,
+      companyId: application.CompanyId,
+      status: application.Status,
+      createdAt: application.CreatedAt,
+      jobTitle: application.job_title,
+      companyName: application.company_name,
+      candidateFirstName: application.candidate_first_name,
+      candidateLastName: application.candidate_last_name,
+      candidateEmail: application.candidate_email
+    };
+
+    return res.json({ success: true, data: responseData });
   } catch (error) {
     console.error('Get Application Detail Error:', error);
     return res.status(500).json({ success: false, message: 'Server error retrieving application detail' });
@@ -134,7 +134,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
 
 // PUT /api/applications/:id - Update status (company owner only)
 router.put('/:id', authenticateToken, requireRole('company'), async (req, res) => {
-  const applicationId = parseInt(req.params.id);
+  const applicationId = req.params.id; // UUID string
   const companyId = req.user.companyId;
   const { status } = req.body;
 
@@ -142,66 +142,43 @@ router.put('/:id', authenticateToken, requireRole('company'), async (req, res) =
     return res.status(403).json({ success: false, message: 'Unauthorized. Company profile required.' });
   }
 
-  const validStatuses = ['pending', 'shortlisted', 'hired', 'rejected'];
+  const validStatuses = ['applied', 'shortlisted', 'contacted', 'hired', 'rejected'];
   if (!status || !validStatuses.includes(status)) {
-    return res.status(400).json({ success: false, message: 'Valid status is required (pending, shortlisted, hired, or rejected)' });
+    return res.status(400).json({ success: false, message: 'Valid status is required (applied, shortlisted, contacted, hired, or rejected)' });
   }
 
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-
     // 1. Verify application exists and company owns the job vacancy
-    const [applications] = await connection.query(
-      `SELECT a.id, a.candidate_id, jv.title as job_title, jv.company_id, cand.user_id as candidate_user_id, c.name as company_name
-       FROM applications a
-       JOIN job_vacancies jv ON a.vacancy_id = jv.id
-       JOIN companies c ON jv.company_id = c.id
-       JOIN candidates cand ON a.candidate_id = cand.id
-       WHERE a.id = ?`,
+    const [applications] = await pool.query(
+      `SELECT a.Id, a.CandidateId, a.CompanyId
+       FROM Applications a
+       WHERE a.Id = ? AND a.IsActive = TRUE`,
       [applicationId]
     );
 
     if (applications.length === 0) {
-      await connection.rollback();
       return res.status(404).json({ success: false, message: 'Application not found' });
     }
 
     const application = applications[0];
 
-    if (application.company_id !== companyId) {
-      await connection.rollback();
+    if (application.CompanyId !== companyId) {
       return res.status(403).json({ success: false, message: 'Unauthorized. You do not own the job vacancy for this application.' });
     }
 
     // 2. Update status
-    await connection.query(
-      'UPDATE applications SET status = ? WHERE id = ?',
+    await pool.query(
+      'UPDATE Applications SET Status = ?, UpdatedAt = CURRENT_TIMESTAMP WHERE Id = ?',
       [status, applicationId]
     );
-
-    // 3. Send notification to candidate
-    await connection.query(
-      'INSERT INTO notifications (user_id, type, message) VALUES (?, ?, ?)',
-      [
-        application.candidate_user_id,
-        'application_status',
-        `Your application status for "${application.job_title}" at ${application.company_name} has been updated to "${status}".`
-      ]
-    );
-
-    await connection.commit();
 
     return res.json({
       success: true,
       message: `Application status updated to ${status} successfully`
     });
   } catch (error) {
-    await connection.rollback();
     console.error('Update Application Status Error:', error);
     return res.status(500).json({ success: false, message: 'Server error updating application status' });
-  } finally {
-    connection.release();
   }
 });
 

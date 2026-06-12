@@ -1,53 +1,84 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const pool = require('../db');
-const { authenticateToken, requireRole } = require('../middleware/auth');
+const { authenticateToken, optionalAuthenticateToken, requireRole } = require('../middleware/auth');
 
 // GET /api/jobs - Get all active jobs (with filters)
-router.get('/', async (req, res) => {
-  const { search, country, workplace_type, employment_type } = req.query;
+router.get('/', optionalAuthenticateToken, async (req, res) => {
+  const { search, countryId, workplaceTypeId, employmentTypeId } = req.query;
 
   try {
     let query = `
-      SELECT jv.*, c.name as company_name, c.logo_url as company_logo, c.industry as company_industry,
-             GROUP_CONCAT(s.name) as skills
-      FROM job_vacancies jv
-      JOIN companies c ON jv.company_id = c.id
-      LEFT JOIN vacancy_skills vs ON jv.id = vs.vacancy_id
-      LEFT JOIN skills s ON vs.skill_id = s.id
-      WHERE jv.status = 'active'
+      SELECT jv.*, c.Name as company_name, c.Logo as company_logo, c.Description as company_description
+      FROM JobVacancies jv
+      JOIN Companies c ON jv.CompanyId = c.Id
+      WHERE jv.Status = 'open' AND jv.IsActive = TRUE
     `;
     const params = [];
 
     if (search) {
-      query += ` AND (jv.title LIKE ? OR jv.description LIKE ?)`;
+      query += ` AND (jv.Title LIKE ? OR jv.Description LIKE ?)`;
       params.push(`%${search}%`, `%${search}%`);
     }
 
-    if (country) {
-      query += ` AND jv.country_code = ?`;
-      params.push(country);
+    if (countryId) {
+      query += ` AND jv.CountryId = ?`;
+      params.push(parseInt(countryId));
     }
 
-    if (workplace_type) {
-      query += ` AND jv.workplace_type = ?`;
-      params.push(workplace_type);
+    if (workplaceTypeId) {
+      query += ` AND jv.WorkplaceTypeId = ?`;
+      params.push(parseInt(workplaceTypeId));
     }
 
-    if (employment_type) {
-      query += ` AND jv.employment_type = ?`;
-      params.push(employment_type);
+    if (employmentTypeId) {
+      query += ` AND jv.EmploymentTypeId = ?`;
+      params.push(parseInt(employmentTypeId));
     }
 
-    query += ` GROUP BY jv.id ORDER BY jv.created_at DESC`;
+    query += ` ORDER BY jv.CreatedAt DESC`;
 
     const [jobs] = await pool.query(query, params);
 
-    // Map concatenated skills back to an array
-    const formattedJobs = jobs.map(job => ({
-      ...job,
-      skills: job.skills ? job.skills.split(',') : []
-    }));
+    // Fetch applied job vacancies if requester is a candidate
+    let appliedVacancyIds = new Set();
+    if (req.user && req.user.role === 'candidate' && req.user.candidateId) {
+      const [apps] = await pool.query('SELECT VacancyId FROM Applications WHERE CandidateId = ? AND IsActive = TRUE', [req.user.candidateId]);
+      appliedVacancyIds = new Set(apps.map(a => a.VacancyId));
+    }
+
+    // Map response
+    const formattedJobs = jobs.map(job => {
+      const isOwner = req.user && req.user.role === 'company' && req.user.companyId === job.CompanyId;
+      const hasApplied = req.user && req.user.role === 'candidate' && appliedVacancyIds.has(job.Id);
+      const showDetails = isOwner || hasApplied;
+
+      let skills = [];
+      if (job.RequiredSkills) {
+        skills = typeof job.RequiredSkills === 'string' ? JSON.parse(job.RequiredSkills) : job.RequiredSkills;
+      }
+
+      return {
+        id: job.Id,
+        companyId: job.CompanyId,
+        userId: job.UserId,
+        title: job.Title,
+        description: job.Description,
+        employmentTypeId: job.EmploymentTypeId,
+        salary: job.Salary,
+        currency: job.Currency,
+        countryId: job.CountryId,
+        workplaceTypeId: job.WorkplaceTypeId,
+        requiredSkills: skills,
+        status: job.Status,
+        deadline: job.Deadline,
+        createdAt: job.CreatedAt,
+        companyName: showDetails ? job.company_name : 'Hidden',
+        companyLogo: showDetails ? job.company_logo : null,
+        companyDescription: showDetails ? job.company_description : null
+      };
+    });
 
     return res.json({ success: true, data: formattedJobs });
   } catch (error) {
@@ -57,15 +88,15 @@ router.get('/', async (req, res) => {
 });
 
 // GET /api/jobs/:id - Get single job detail
-router.get('/:id', async (req, res) => {
-  const jobId = parseInt(req.params.id);
+router.get('/:id', optionalAuthenticateToken, async (req, res) => {
+  const jobId = req.params.id; // UUID string
 
   try {
     const [jobs] = await pool.query(
-      `SELECT jv.*, c.name as company_name, c.logo_url as company_logo, c.industry as company_industry, c.description as company_description
-       FROM job_vacancies jv
-       JOIN companies c ON jv.company_id = c.id
-       WHERE jv.id = ?`,
+      `SELECT jv.*, c.Name as company_name, c.Logo as company_logo, c.Description as company_description
+       FROM JobVacancies jv
+       JOIN Companies c ON jv.CompanyId = c.Id
+       WHERE jv.Id = ? AND jv.IsActive = TRUE`,
       [jobId]
     );
 
@@ -75,18 +106,48 @@ router.get('/:id', async (req, res) => {
 
     const job = jobs[0];
 
-    // Fetch skills
-    const [skills] = await pool.query(
-      `SELECT s.id, s.name
-       FROM vacancy_skills vs
-       JOIN skills s ON vs.skill_id = s.id
-       WHERE vs.vacancy_id = ?`,
-      [jobId]
-    );
+    // Determine if company details should be shown
+    let showDetails = false;
+    if (req.user) {
+      if (req.user.role === 'company' && req.user.companyId === job.CompanyId) {
+        showDetails = true;
+      } else if (req.user.role === 'candidate' && req.user.candidateId) {
+        const [apps] = await pool.query(
+          'SELECT Id FROM Applications WHERE CandidateId = ? AND VacancyId = ? AND IsActive = TRUE',
+          [req.user.candidateId, jobId]
+        );
+        if (apps.length > 0) {
+          showDetails = true;
+        }
+      }
+    }
 
-    job.skills = skills;
+    let skills = [];
+    if (job.RequiredSkills) {
+      skills = typeof job.RequiredSkills === 'string' ? JSON.parse(job.RequiredSkills) : job.RequiredSkills;
+    }
 
-    return res.json({ success: true, data: job });
+    const jobData = {
+      id: job.Id,
+      companyId: job.CompanyId,
+      userId: job.UserId,
+      title: job.Title,
+      description: job.Description,
+      employmentTypeId: job.EmploymentTypeId,
+      salary: job.Salary,
+      currency: job.Currency,
+      countryId: job.CountryId,
+      workplaceTypeId: job.WorkplaceTypeId,
+      requiredSkills: skills,
+      status: job.Status,
+      deadline: job.Deadline,
+      createdAt: job.CreatedAt,
+      companyName: showDetails ? job.company_name : 'Hidden',
+      companyLogo: showDetails ? job.company_logo : null,
+      companyDescription: showDetails ? job.company_description : null
+    };
+
+    return res.json({ success: true, data: jobData });
   } catch (error) {
     console.error('Get Job Detail Error:', error);
     return res.status(500).json({ success: false, message: 'Server error retrieving job detail' });
@@ -101,155 +162,115 @@ router.post('/', authenticateToken, requireRole('company'), async (req, res) => 
     return res.status(403).json({ success: false, message: 'Unauthorized. Company profile required.' });
   }
 
-  const { title, description, employment_type, salary, currency, country_code, workplace_type, deadline, skills } = req.body;
+  const { title, description, employmentTypeId, salary, currency, countryId, workplaceTypeId, deadline, requiredSkills } = req.body;
 
-  if (!title || !employment_type || !workplace_type) {
-    return res.status(400).json({ success: false, message: 'Title, employment type, and workplace type are required' });
+  if (!title || !employmentTypeId || !workplaceTypeId) {
+    return res.status(400).json({ success: false, message: 'Title, employmentTypeId, and workplaceTypeId are required' });
   }
 
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
+    const jobId = crypto.randomUUID();
+    const skillsJSON = requiredSkills ? JSON.stringify(requiredSkills) : '[]';
 
-    // Insert job vacancy
-    const [jobResult] = await connection.query(
-      `INSERT INTO job_vacancies (company_id, title, description, employment_type, salary, currency, country_code, workplace_type, deadline, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
-      [companyId, title, description || null, employment_type, salary || null, currency || null, country_code || null, workplace_type, deadline || null]
+    await pool.query(
+      `INSERT INTO JobVacancies (Id, CompanyId, UserId, Title, Description, EmploymentTypeId, Salary, Currency, CountryId, WorkplaceTypeId, RequiredSkills, Status, Deadline, IsActive)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, TRUE)`,
+      [
+        jobId,
+        companyId,
+        req.user.id,
+        title,
+        description || null,
+        parseInt(employmentTypeId),
+        salary || null,
+        currency || null,
+        countryId ? parseInt(countryId) : null,
+        parseInt(workplaceTypeId),
+        skillsJSON,
+        deadline || null
+      ]
     );
-
-    const jobId = jobResult.insertId;
-
-    // Insert skills if provided
-    if (skills && Array.isArray(skills)) {
-      for (const skillName of skills) {
-        if (typeof skillName !== 'string' || skillName.trim() === '') continue;
-        const normalizedSkill = skillName.trim();
-
-        // 1. Get or create skill
-        let skillId;
-        const [existingSkills] = await connection.query('SELECT id FROM skills WHERE LOWER(name) = LOWER(?)', [normalizedSkill]);
-        if (existingSkills.length > 0) {
-          skillId = existingSkills[0].id;
-        } else {
-          const [insertSkillResult] = await connection.query('INSERT INTO skills (name) VALUES (?)', [normalizedSkill]);
-          skillId = insertSkillResult.insertId;
-        }
-
-        // 2. Link skill to vacancy
-        await connection.query(
-          'INSERT INTO vacancy_skills (vacancy_id, skill_id) VALUES (?, ?)',
-          [jobId, skillId]
-        );
-      }
-    }
-
-    await connection.commit();
 
     return res.status(201).json({
       success: true,
       message: 'Job vacancy created successfully',
       data: {
         id: jobId,
-        company_id: companyId,
+        companyId,
         title,
-        employment_type,
-        workplace_type
+        employmentTypeId,
+        workplaceTypeId
       }
     });
   } catch (error) {
-    await connection.rollback();
     console.error('Create Job Error:', error);
     return res.status(500).json({ success: false, message: 'Server error creating job vacancy' });
-  } finally {
-    connection.release();
   }
 });
 
 // PUT /api/jobs/:id - Update job vacancy (company owner only)
 router.put('/:id', authenticateToken, requireRole('company'), async (req, res) => {
-  const jobId = parseInt(req.params.id);
+  const jobId = req.params.id; // UUID string
   const companyId = req.user.companyId;
 
   if (!companyId) {
     return res.status(403).json({ success: false, message: 'Unauthorized. Company profile required.' });
   }
 
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-
     // Verify vacancy ownership
-    const [jobs] = await connection.query('SELECT company_id FROM job_vacancies WHERE id = ?', [jobId]);
+    const [jobs] = await pool.query('SELECT CompanyId FROM JobVacancies WHERE Id = ?', [jobId]);
     if (jobs.length === 0) {
-      await connection.rollback();
       return res.status(404).json({ success: false, message: 'Job vacancy not found' });
     }
 
-    if (jobs[0].company_id !== companyId) {
-      await connection.rollback();
+    if (jobs[0].CompanyId !== companyId) {
       return res.status(403).json({ success: false, message: 'Unauthorized. You do not own this job vacancy.' });
     }
 
-    const { title, description, employment_type, salary, currency, country_code, workplace_type, status, deadline, skills } = req.body;
+    const { title, description, employmentTypeId, salary, currency, countryId, workplaceTypeId, status, deadline, requiredSkills } = req.body;
 
-    // Update job vacancy
-    await connection.query(
-      `UPDATE job_vacancies
-       SET title = COALESCE(?, title),
-           description = COALESCE(?, description),
-           employment_type = COALESCE(?, employment_type),
-           salary = COALESCE(?, salary),
-           currency = COALESCE(?, currency),
-           country_code = COALESCE(?, country_code),
-           workplace_type = COALESCE(?, workplace_type),
-           status = COALESCE(?, status),
-           deadline = COALESCE(?, deadline)
-       WHERE id = ?`,
-      [title, description, employment_type, salary, currency, country_code, workplace_type, status, deadline, jobId]
+    const skillsJSON = requiredSkills ? JSON.stringify(requiredSkills) : undefined;
+
+    await pool.query(
+      `UPDATE JobVacancies
+       SET Title = COALESCE(?, Title),
+           Description = COALESCE(?, Description),
+           EmploymentTypeId = COALESCE(?, EmploymentTypeId),
+           Salary = COALESCE(?, Salary),
+           Currency = COALESCE(?, Currency),
+           CountryId = COALESCE(?, CountryId),
+           WorkplaceTypeId = COALESCE(?, WorkplaceTypeId),
+           Status = COALESCE(?, Status),
+           Deadline = COALESCE(?, Deadline),
+           RequiredSkills = COALESCE(?, RequiredSkills),
+           UpdatedAt = CURRENT_TIMESTAMP
+       WHERE Id = ?`,
+      [
+        title || null,
+        description || null,
+        employmentTypeId ? parseInt(employmentTypeId) : null,
+        salary || null,
+        currency || null,
+        countryId ? parseInt(countryId) : null,
+        workplaceTypeId ? parseInt(workplaceTypeId) : null,
+        status || null,
+        deadline || null,
+        skillsJSON || null,
+        jobId
+      ]
     );
 
-    // Update skills if provided
-    if (skills && Array.isArray(skills)) {
-      // Clear existing skill links
-      await connection.query('DELETE FROM vacancy_skills WHERE vacancy_id = ?', [jobId]);
-
-      for (const skillName of skills) {
-        if (typeof skillName !== 'string' || skillName.trim() === '') continue;
-        const normalizedSkill = skillName.trim();
-
-        // Get or create skill
-        let skillId;
-        const [existingSkills] = await connection.query('SELECT id FROM skills WHERE LOWER(name) = LOWER(?)', [normalizedSkill]);
-        if (existingSkills.length > 0) {
-          skillId = existingSkills[0].id;
-        } else {
-          const [insertSkillResult] = await connection.query('INSERT INTO skills (name) VALUES (?)', [normalizedSkill]);
-          skillId = insertSkillResult.insertId;
-        }
-
-        // Link skill to vacancy
-        await connection.query(
-          'INSERT INTO vacancy_skills (vacancy_id, skill_id) VALUES (?, ?)',
-          [jobId, skillId]
-        );
-      }
-    }
-
-    await connection.commit();
     return res.json({ success: true, message: 'Job vacancy updated successfully' });
   } catch (error) {
-    await connection.rollback();
     console.error('Update Job Error:', error);
     return res.status(500).json({ success: false, message: 'Server error updating job vacancy' });
-  } finally {
-    connection.release();
   }
 });
 
 // DELETE /api/jobs/:id - Delete job vacancy (company owner only)
 router.delete('/:id', authenticateToken, requireRole('company'), async (req, res) => {
-  const jobId = parseInt(req.params.id);
+  const jobId = req.params.id; // UUID string
   const companyId = req.user.companyId;
 
   if (!companyId) {
@@ -258,17 +279,17 @@ router.delete('/:id', authenticateToken, requireRole('company'), async (req, res
 
   try {
     // Verify vacancy ownership
-    const [jobs] = await pool.query('SELECT company_id FROM job_vacancies WHERE id = ?', [jobId]);
+    const [jobs] = await pool.query('SELECT CompanyId FROM JobVacancies WHERE Id = ?', [jobId]);
     if (jobs.length === 0) {
       return res.status(404).json({ success: false, message: 'Job vacancy not found' });
     }
 
-    if (jobs[0].company_id !== companyId) {
+    if (jobs[0].CompanyId !== companyId) {
       return res.status(403).json({ success: false, message: 'Unauthorized. You do not own this job vacancy.' });
     }
 
-    // Delete job vacancy (Cascades to vacancy_skills, applications)
-    await pool.query('DELETE FROM job_vacancies WHERE id = ?', [jobId]);
+    // Delete job vacancy (Cascades in DB or manual)
+    await pool.query('DELETE FROM JobVacancies WHERE Id = ?', [jobId]);
 
     return res.json({ success: true, message: 'Job vacancy deleted successfully' });
   } catch (error) {

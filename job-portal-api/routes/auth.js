@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const pool = require('../db');
 require('dotenv').config();
 
@@ -9,14 +10,29 @@ require('dotenv').config();
 router.post('/register', async (req, res) => {
   const { first_name, last_name, email, password, role, mobile_no, company_name } = req.body;
 
+  // Normalize parameters (handling camelCase or snake_case inputs)
+  const FirstName = first_name || req.body.FirstName;
+  const LastName = last_name || req.body.LastName;
+  const Email = email || req.body.Email;
+  const Password = password || req.body.Password;
+  const MobileNo = mobile_no || req.body.MobileNo;
+  const Role = role || req.body.Role;
+  const CompanyName = company_name || req.body.CompanyName;
+
   // Basic validation
-  if (!first_name || !last_name || !email || !password) {
+  if (!FirstName || !LastName || !Email || !Password) {
     return res.status(400).json({ success: false, message: 'First name, last name, email, and password are required' });
   }
 
-  const userRole = role === 'company' ? 'company' : 'candidate';
+  // Map role
+  let userRole = 2; // Default to Candidate
+  if (Role === 'company' || Role === 3) {
+    userRole = 3;
+  } else if (Role === 'admin' || Role === 1) {
+    userRole = 1;
+  }
 
-  if (userRole === 'company' && !company_name) {
+  if (userRole === 3 && !CompanyName) {
     return res.status(400).json({ success: false, message: 'Company name is required for registration as a company' });
   }
 
@@ -24,8 +40,8 @@ router.post('/register', async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    // Check if email already exists
-    const [existingUsers] = await connection.query('SELECT id FROM users WHERE email = ?', [email]);
+    // Check if email already exists (using PascalCase column)
+    const [existingUsers] = await connection.query('SELECT Id FROM Users WHERE Email = ?', [Email]);
     if (existingUsers.length > 0) {
       await connection.rollback();
       return res.status(400).json({ success: false, message: 'Email is already registered' });
@@ -33,41 +49,51 @@ router.post('/register', async (req, res) => {
 
     // Hash password
     const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(password, salt);
+    const passwordHash = await bcrypt.hash(Password, salt);
 
-    // Insert user into users table
-    const [userResult] = await connection.query(
-      `INSERT INTO users (first_name, last_name, email, password_hash, mobile_no, role) 
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [first_name, last_name, email, passwordHash, mobile_no || null, userRole]
+    // Generate User UUID
+    const userId = crypto.randomUUID();
+
+    // Insert user into Users table
+    await connection.query(
+      `INSERT INTO Users (Id, FirstName, LastName, Email, PasswordHash, MobileNo, UserRole, IsActive) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)`,
+      [userId, FirstName, LastName, Email, passwordHash, MobileNo || null, userRole]
     );
 
-    const userId = userResult.insertId;
+    let candidateId = null;
+    let companyId = null;
 
     // Initialize profile based on role
-    if (userRole === 'candidate') {
+    if (userRole === 2) {
+      candidateId = crypto.randomUUID();
       await connection.query(
-        'INSERT INTO candidates (user_id) VALUES (?)',
-        [userId]
+        'INSERT INTO Candidate (Id, UserId, Visibility, IsActive) VALUES (?, ?, "public", TRUE)',
+        [candidateId, userId]
       );
-    } else {
+    } else if (userRole === 3) {
+      companyId = crypto.randomUUID();
       await connection.query(
-        'INSERT INTO companies (user_id, name) VALUES (?, ?)',
-        [userId, company_name]
+        'INSERT INTO Companies (Id, UserId, Name, IsActive) VALUES (?, ?, ?, TRUE)',
+        [companyId, userId, CompanyName]
       );
     }
 
     await connection.commit();
+
+    const roleName = userRole === 1 ? 'admin' : (userRole === 2 ? 'candidate' : 'company');
 
     return res.status(201).json({
       success: true,
       message: 'User registered successfully',
       data: {
         userId,
-        first_name,
-        last_name,
-        email,
-        role: userRole
+        candidateId,
+        companyId,
+        first_name: FirstName,
+        last_name: LastName,
+        email: Email,
+        role: roleName
       }
     });
   } catch (error) {
@@ -81,15 +107,16 @@ router.post('/register', async (req, res) => {
 
 // POST /api/auth/login - Login, return JWT token
 router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
+  const Email = req.body.email || req.body.Email;
+  const Password = req.body.password || req.body.Password;
 
-  if (!email || !password) {
+  if (!Email || !Password) {
     return res.status(400).json({ success: false, message: 'Email and password are required' });
   }
 
   try {
     // Fetch user details
-    const [users] = await pool.query('SELECT * FROM users WHERE email = ?', [email]);
+    const [users] = await pool.query('SELECT * FROM Users WHERE Email = ? AND IsActive = TRUE', [Email]);
     if (users.length === 0) {
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
@@ -97,7 +124,7 @@ router.post('/login', async (req, res) => {
     const user = users[0];
 
     // Verify password
-    const isMatch = await bcrypt.compare(password, user.password_hash);
+    const isMatch = await bcrypt.compare(Password, user.PasswordHash);
     if (!isMatch) {
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
@@ -106,23 +133,26 @@ router.post('/login', async (req, res) => {
     let candidateId = null;
     let companyId = null;
 
-    if (user.role === 'candidate') {
-      const [candidates] = await pool.query('SELECT id FROM candidates WHERE user_id = ?', [user.id]);
+    if (user.UserRole === 2) {
+      const [candidates] = await pool.query('SELECT Id FROM Candidate WHERE UserId = ? AND IsActive = TRUE', [user.Id]);
       if (candidates.length > 0) {
-        candidateId = candidates[0].id;
+        candidateId = candidates[0].Id;
       }
-    } else if (user.role === 'company') {
-      const [companies] = await pool.query('SELECT id FROM companies WHERE user_id = ?', [user.id]);
+    } else if (user.UserRole === 3) {
+      const [companies] = await pool.query('SELECT Id FROM Companies WHERE UserId = ? AND IsActive = TRUE', [user.Id]);
       if (companies.length > 0) {
-        companyId = companies[0].id;
+        companyId = companies[0].Id;
       }
     }
 
+    const roleName = user.UserRole === 1 ? 'admin' : (user.UserRole === 2 ? 'candidate' : 'company');
+
     // Create JWT Token
     const payload = {
-      id: user.id,
-      email: user.email,
-      role: user.role,
+      id: user.Id,
+      email: user.Email,
+      role: roleName,
+      roleId: user.UserRole,
       candidateId,
       companyId
     };
@@ -135,11 +165,11 @@ router.post('/login', async (req, res) => {
       data: {
         token,
         user: {
-          id: user.id,
-          first_name: user.first_name,
-          last_name: user.last_name,
-          email: user.email,
-          role: user.role,
+          id: user.Id,
+          first_name: user.FirstName,
+          last_name: user.LastName,
+          email: user.Email,
+          role: roleName,
           candidateId,
           companyId
         }
