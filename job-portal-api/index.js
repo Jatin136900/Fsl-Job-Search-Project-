@@ -64,6 +64,26 @@ app.get('/health', (req, res) => {
   res.json({ success: true, message: 'Job Portal API is running smoothly.' });
 });
 
+// Database Debug/Diagnostics Endpoint
+app.get('/debug-db', async (req, res) => {
+  const dbConfig = {
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    database: process.env.DB_NAME,
+    port: process.env.DB_PORT,
+    hasPassword: !!process.env.DB_PASSWORD,
+    hasJwtSecret: !!process.env.JWT_SECRET
+  };
+  
+  try {
+    const pool = require('./db');
+    await pool.query('SELECT 1');
+    return res.json({ success: true, dbConfig, connection: 'Successful' });
+  } catch (err) {
+    return res.status(500).json({ success: false, dbConfig, error: err.message, stack: err.stack });
+  }
+});
+
 // 404 Route handler
 app.use((req, res) => {
   res.status(404).json({ success: false, message: 'Endpoint not found' });
